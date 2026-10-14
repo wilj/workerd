@@ -124,6 +124,8 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   kj::String dockerPath;
   kj::String containerName;
   kj::String sidecarContainerName;
+  // The volume the sidecar keeps its trusted CAs in, mounted read-only into the container.
+  kj::String trustVolumeName;
   kj::String imageName;
 
   // Container egress interceptor image name (sidecar for egress proxy)
@@ -258,20 +260,12 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
       kj::Maybe<kj::StringPtr> hostname,
       EgressProtocol protocol);
 
-  kj::Promise<void> writeFileToContainer(kj::StringPtr container,
-      kj::StringPtr dir,
-      kj::StringPtr filename,
-      kj::ArrayPtr<const kj::byte> content);
-  kj::Promise<void> readCACert();
-  kj::Promise<void> injectCACert();
-
   // Whether general internet access is enabled for this container, when known.
   kj::Maybe<bool> internetEnabled = kj::none;
 
   std::atomic_bool containerStarted = false;
   std::atomic_bool containerSidecarStarted = false;
   std::atomic_bool egressListenerStarted = false;
-  std::atomic_bool caCertInjected = false;
 
   // Volatile in-memory label set for this container.
   kj::HashMap<kj::String, kj::String> labels;
@@ -279,9 +273,6 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
   // Writable clone volumes currently owned by the app container, or by an in-flight start()
   // that still needs failure cleanup.
   kj::Vector<kj::String> snapshotClones;
-
-  // CA cert read from the sidecar after it starts.
-  kj::Maybe<kj::String> caCert;
 
   kj::Maybe<kj::Own<kj::HttpServer>> egressHttpServer;
   kj::Maybe<kj::Promise<void>> egressListenerTask;

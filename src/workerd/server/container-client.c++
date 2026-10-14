@@ -62,7 +62,6 @@ static_assert(static_cast<double>(MAX_SNAPSHOT_TAR_SIZE) == MAX_SNAPSHOT_TAR_SIZ
     "MAX_SNAPSHOT_TAR_SIZE must be exactly representable as double");
 
 // POSIX tar stores file size in an 11-digit octal header field.
-constexpr size_t MAX_TAR_CONTENT_SIZE = 8ull * 1024 * 1024 * 1024;
 
 // Ensures the stale-volume check runs at most once per process.
 std::atomic_bool staleSnapshotVolumeCheckScheduled = false;
@@ -495,55 +494,6 @@ kj::StringPtr signalToString(uint32_t signal) {
     default:
       return "SIGKILL"_kj;
   }
-}
-
-void writeTarField(kj::ArrayPtr<kj::byte> field, kj::StringPtr value) {
-  auto len = kj::min(value.size(), field.size());
-  field.write(value.asBytes().first(len));
-}
-
-// createTarWithFile creates simple tar files without importing a full blown TAR library.
-// It's a pretty limited method that creates a single tar file with a single file on it,
-// as the Docker API only accepts tars.
-kj::Array<kj::byte> createTarWithFile(
-    kj::StringPtr filename, kj::ArrayPtr<const kj::byte> content) {
-  KJ_REQUIRE(filename.size() < 100, "tar filename must be < 100 bytes");
-  KJ_REQUIRE(content.size() < MAX_TAR_CONTENT_SIZE, "tar content too large for 11-digit octal");
-
-  size_t paddedSize = (content.size() + 511) & ~static_cast<size_t>(511);
-  size_t totalSize = 512 + paddedSize + 1024;
-  auto tar = kj::heapArray<kj::byte>(totalSize);
-  tar.asPtr().fill(0);
-
-  auto header = tar.first(512);
-  writeTarField(header.first(100), filename);
-  writeTarField(header.slice(100, 108), "0000644"_kj);
-  writeTarField(header.slice(108, 116), "0000000"_kj);
-  writeTarField(header.slice(116, 124), "0000000"_kj);
-
-  {
-    char sizeBuf[12];
-    snprintf(sizeBuf, sizeof(sizeBuf), "%011" PRIo64, static_cast<uint64_t>(content.size()));
-    writeTarField(header.slice(124, 136), kj::StringPtr(sizeBuf));
-  }
-
-  writeTarField(header.slice(136, 148), "00000000000"_kj);
-  header[156] = '0';
-  writeTarField(header.slice(257, 263), "ustar"_kj);
-  writeTarField(header.slice(263, 265), "00"_kj);
-
-  header.slice(148, 156).fill(' ');
-  uint32_t checksum = 0;
-  for (auto byte: header) checksum += byte;
-
-  {
-    char checksumBuf[8];
-    snprintf(checksumBuf, sizeof(checksumBuf), "%06o ", checksum);
-    writeTarField(header.slice(148, 155), kj::StringPtr(checksumBuf));
-  }
-
-  tar.slice(512, 512 + content.size()).copyFrom(content);
-  return tar;
 }
 
 // Shared Docker API HTTP helper. Connects to the Docker socket, sends a request with an
@@ -1042,6 +992,7 @@ ContainerClient::ContainerClient(capnp::ByteStreamFactory& byteStreamFactory,
       dockerPath(kj::mv(dockerPath)),
       containerName(kj::encodeUriComponent(kj::str(containerName))),
       sidecarContainerName(kj::encodeUriComponent(kj::str(containerName, "-proxy"))),
+      trustVolumeName(kj::encodeUriComponent(kj::str(containerName, "-proxy-certs"))),
       imageName(kj::mv(imageName)),
       containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImage)),
       privileges(kj::mv(privileges)),
@@ -1062,9 +1013,8 @@ ContainerClient::~ContainerClient() noexcept(false) {
   stopEgressListener();
 
   // Best-effort cleanup for both containers.
-  auto sidecarCleanup =
-      removeContainer(network, kj::str(dockerPath), kj::str(sidecarContainerName), false)
-          .catch_([](kj::Exception&&) {});
+  auto sidecarCleanup = removeContainer(network, kj::str(dockerPath), kj::str(sidecarContainerName))
+                            .catch_([](kj::Exception&&) {});
 
   // Also try to delete any cloned snapshot volumes.
   auto volumes = snapshotClones.releaseAsArray();
@@ -1079,7 +1029,12 @@ ContainerClient::~ContainerClient() noexcept(false) {
   // canceler (so a future client creation can cancel it), stores it so the next
   // ContainerClient can await it, and adds a branch to waitUntilTasks to keep the
   // underlying I/O alive.
-  cleanupCallback(kj::joinPromises(kj::arr(kj::mv(sidecarCleanup), kj::mv(mainCleanup))));
+  auto trustCleanup = kj::joinPromises(kj::arr(kj::mv(sidecarCleanup), kj::mv(mainCleanup)))
+                          .then([&network = network, dockerPath = kj::str(dockerPath),
+                                    volume = kj::str(trustVolumeName)]() mutable {
+    return deleteVolumes(network, kj::mv(dockerPath), kj::arr(kj::mv(volume)));
+  }).catch_([](kj::Exception&&) {});
+  cleanupCallback(kj::mv(trustCleanup));
 }
 
 // Docker-specific Port implementation that implements rpc::Container::Port::Server
@@ -1592,70 +1547,13 @@ void ContainerClient::stopEgressListener() {
   egressListenerStarted.store(false, std::memory_order_release);
 }
 
-kj::Promise<void> ContainerClient::writeFileToContainer(kj::StringPtr container,
-    kj::StringPtr dir,
-    kj::StringPtr filename,
-    kj::ArrayPtr<const kj::byte> content) {
-  kj::HttpHeaderTable table;
-  auto address = co_await network.parseAddress(kj::str(dockerPath));
-  auto connection = co_await address->connect();
-  auto httpClient = kj::newHttpClient(table, *connection).attach(kj::mv(connection));
-
-  auto tar = createTarWithFile(filename, content);
-
-  kj::HttpHeaders headers(table);
-  headers.setPtr(kj::HttpHeaderId::HOST, "localhost");
-  headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/x-tar");
-  headers.set(kj::HttpHeaderId::CONTENT_LENGTH, kj::str(tar.size()));
-
-  auto endpoint = kj::str("/containers/", container, "/archive?path=", kj::encodeUriComponent(dir));
-  auto req = httpClient->request(kj::HttpMethod::PUT, endpoint, headers, tar.size());
-  {
-    auto body = kj::mv(req.body);
-    co_await body->write(tar.asBytes());
-  }
-
-  auto response = co_await req.response;
-  auto result = co_await response.body->readAllText();
-  JSG_REQUIRE(response.statusCode == 200, Error, "Failed to write file ", dir, "/", filename,
-      " to container [", response.statusCode, "] ", result);
-}
-
-static constexpr kj::StringPtr cloudflareCaDir = "/etc"_kj;
-static constexpr kj::StringPtr cloudflareCaFilename =
-    "cloudflare/certs/cloudflare-containers-ca.crt"_kj;
-
-kj::Promise<void> ContainerClient::readCACert() {
-  auto ingressPort = KJ_REQUIRE_NONNULL(
-      sidecarIngressHostPort, "Cannot read CA cert: sidecar ingress port not known");
-
-  auto response = co_await dockerApiRequest(
-      network, kj::str("127.0.0.1:", ingressPort), kj::HttpMethod::GET, kj::str("/ca"));
-
-  JSG_REQUIRE(response.statusCode == 200, Error,
-      "Failed to read CA cert from sidecar: ", response.statusCode, " ", response.body);
-
-  caCert = kj::mv(response.body);
-}
-
-kj::Promise<void> ContainerClient::injectCACert() {
-  if (caCertInjected.exchange(true, std::memory_order_acquire)) {
-    co_return;
-  }
-
-  bool succeeded = false;
-  KJ_DEFER(if (!succeeded) caCertInjected.store(false, std::memory_order_release));
-
-  if (caCert == kj::none) {
-    co_await readCACert();
-  }
-
-  auto& cert = KJ_REQUIRE_NONNULL(caCert, "CA cert not read from sidecar yet");
-  co_await writeFileToContainer(
-      containerName, cloudflareCaDir, cloudflareCaFilename, cert.asBytes());
-
-  succeeded = true;
-}
+// The CAs the sidecar intercepts TLS with are kept in a volume of their own, written by the sidecar
+// and mounted read-only into the container where a container image trusts them from. The sidecar
+// replaces its CA before it ends and rewrites the file each time, so the container sees what the
+// sidecar trusts now, including a container started beside a sidecar that was kept warm.
+static constexpr kj::StringPtr sidecarTrustDir = "/cloudflare-certs"_kj;
+static constexpr kj::StringPtr containerTrustDir = "/etc/cloudflare/certs"_kj;
+static constexpr kj::StringPtr trustFilename = "cloudflare-containers-ca.crt"_kj;
 
 kj::Promise<kj::Maybe<ContainerClient::InspectResponse>> ContainerClient::inspectContainer() {
   auto endpoint = kj::str("/containers/", containerName, "/json");
@@ -1830,8 +1728,15 @@ kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
     hostConfig.setPidMode("host");
   }
 
+  auto mounts = hostConfig.initMounts(restoreMounts.size() + 1);
+  {
+    auto trust = mounts[restoreMounts.size()];
+    trust.setType("volume");
+    trust.setSource(trustVolumeName);
+    trust.setTarget(containerTrustDir);
+    trust.setReadOnly(true);
+  }
   if (restoreMounts.size() > 0) {
-    auto mounts = hostConfig.initMounts(restoreMounts.size());
     for (auto i: kj::indices(restoreMounts)) {
       auto mount = mounts[i];
       auto& restoreMount = restoreMounts[i];
@@ -2115,7 +2020,7 @@ kj::Promise<void> ContainerClient::createSidecarContainer(
 
   // determined by the number of flags we need to pass to proxy-everything
   uint32_t cmdSize =
-      8;  // --http-egress-port <port> --http-ingress-address 0.0.0.0:<port> --docker-gateway-cidr <cidr> --dns-enabled --tls-intercept
+      10;  // --http-egress-port <port> --http-ingress-address 0.0.0.0:<port> --docker-gateway-cidr <cidr> --dns-enabled --tls-intercept --tls-trust-file <file>
   if (!ipv6Enabled) cmdSize += 1;  // --disable-ipv6
 
   auto cmd = jsonRoot.initCmd(cmdSize);
@@ -2128,6 +2033,8 @@ kj::Promise<void> ContainerClient::createSidecarContainer(
   cmd.set(idx++, networkCidr);
   cmd.set(idx++, "--dns-enabled");
   cmd.set(idx++, "--tls-intercept");
+  cmd.set(idx++, "--tls-trust-file");
+  cmd.set(idx++, kj::str(sidecarTrustDir, "/", trustFilename));
   if (!ipv6Enabled) {
     cmd.set(idx++, "--disable-ipv6");
   }
@@ -2144,6 +2051,11 @@ kj::Promise<void> ContainerClient::createSidecarContainer(
   // Sidecar needs NET_ADMIN capability for iptables/TPROXY
   auto capAdd = hostConfig.initCapAdd(1);
   capAdd.set(0, "NET_ADMIN");
+
+  auto trust = hostConfig.initMounts(1)[0];
+  trust.setType("volume");
+  trust.setSource(trustVolumeName);
+  trust.setTarget(sidecarTrustDir);
 
   auto response = co_await dockerApiRequest(network, kj::str(dockerPath), kj::HttpMethod::POST,
       kj::str("/containers/create?name=", sidecarContainerName), codec.encode(jsonRoot));
@@ -2370,7 +2282,6 @@ kj::Promise<void> ContainerClient::status(StatusContext context) {
     this->sidecarIngressHostPort = sidecar.ingressHostPort;
     co_await ensureEgressListenerStarted();
     co_await updateSidecarEgressPort(sidecar.ingressHostPort, egressListenerPort);
-    co_await readCACert();
   }
 
   context.getResults().setRunning(isRunning);
@@ -2524,15 +2435,7 @@ kj::Promise<void> ContainerClient::start(StartContext context) {
     co_await updateSidecarEgressConfig(ingressHostPort, egressListenerPort);
   }
 
-  caCertInjected.store(false, std::memory_order_release);
   co_await createContainer(effectiveImage, entrypoint, environment, restoreMounts.asPtr(), params);
-
-  for (auto& mapping: egressState->mappings) {
-    if (mapping.protocol == EgressProtocol::HTTPS) {
-      co_await injectCACert();
-      break;
-    }
-  }
 
   co_await startContainer();
 
@@ -2957,8 +2860,6 @@ kj::Promise<void> ContainerClient::ensureSidecarStarted() {
       kj::throwFatalException(kj::mv(KJ_REQUIRE_NONNULL(maybeError)));
     co_await timer.afterDelay(READY_RETRY_DELAY);
   }
-
-  co_await readCACert();
 }
 
 kj::Promise<void> ContainerClient::ensureEgressListenerStarted(uint16_t port) {
@@ -3026,10 +2927,6 @@ kj::Promise<void> ContainerClient::setEgressHttps(SetEgressHttpsContext context)
   uint16_t port = parsed.port.orDefault(443);
 
   co_await ensureEgressListenerStarted();
-
-  if (containerStarted.load(std::memory_order_acquire)) {
-    co_await injectCACert();
-  }
 
   auto subrequestChannel = channelTokenHandler.decodeSubrequestChannelToken(
       workerd::IoChannelFactory::ChannelTokenUsage::RPC, tokenBytes);
