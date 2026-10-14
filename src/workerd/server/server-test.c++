@@ -7582,6 +7582,298 @@ KJ_TEST("Server: DO facet abort during pending startup") {
   conn.recvHttp200("caught: aborted during startup");
 }
 
+// Regression test for a use-after-free in the facet tree's back-pointers.
+//
+// `ActorContainer::parent` and `ActorContainer::root` are non-owning back-pointers: ownership in
+// the facet tree runs downward only. A facet can nevertheless outlive the container it points
+// back at, because a `FacetOutgoingFactory` in the parent's own `IoContext` caches an
+// `ActorChannelImpl` which holds a reference to the facet's `ActorContainer`. When that cached
+// channel is finally destroyed, `~ActorChannelImpl()` calls `updateAccessTime()` on the facet,
+// which walks `parent` -- reading freed memory if the parent has already been destroyed.
+//
+// This test constructs the precondition: it creates a facet and drives a call through it so the
+// channel is cached, detaches the facet with `ctx.facets.abort()` (which removes it from the
+// parent's facet map while the cached channel keeps it alive), keeps the stub reachable so the
+// channel is not collected early, and then breaks the parent with `ctx.abort()` so that
+// `monitorOnBroken()` erases the parent's `ActorContainer` from the namespace map.
+//
+// NOTE: whether the stale read actually faults depends on the order in which the last
+// `Worker::Actor` reference and the last `ActorContainer` reference happen to be dropped, which
+// nothing in JS controls -- in production this crashed on roughly six occasions out of ten with
+// an identical workload. Run this test under ASAN to observe the failure deterministically; in a
+// plain build it is a smoke test that the teardown path still completes.
+KJ_TEST("Server: DO facet outliving an aborted parent") {
+  kj::StringPtr config = R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `
+                `export default {
+                `  async fetch(request, env, ctx) {
+                `    let id = ctx.exports.Parent.idFromName("test");
+                `    let actor = ctx.exports.Parent.get(id);
+                `    try {
+                `      return await actor.fetch(request);
+                `    } catch (err) {
+                `      return new Response("aborted: " + err.message.includes("parent aborted"));
+                `    }
+                `  }
+                `}
+                `
+                `export class Parent extends DurableObject {
+                `  async fetch(request) {
+                `    // Drive a call through a facet, so that the FacetOutgoingFactory living in
+                `    // this actor's IoContext caches an ActorChannelImpl for the facet.
+                `    let facet = this.ctx.facets.get("child",
+                `        () => ({class: this.ctx.exports.Child}));
+                `    await facet.ping();
+                `
+                `    // Keep the stub reachable, so the cached channel is not collected. Its
+                `    // destructor is what walks the facet's `parent` back-pointer.
+                `    this.detachedFacet = facet;
+                `
+                `    // Remove the facet from our facet map. Its ActorContainer survives, because
+                `    // the cached channel still holds a reference to it, but we will never see it
+                `    // again in order to clear its back-pointers.
+                `    this.ctx.facets.abort("child", new Error("detached"));
+                `
+                `    // Break ourselves. monitorOnBroken() erases our own ActorContainer from the
+                `    // namespace map, after which the detached facet's `parent` is stale.
+                `    this.ctx.abort(new Error("parent aborted"));
+                `
+                `    return new Response("unreachable");
+                `  }
+                `}
+                `
+                `export class Child extends DurableObject {
+                `  ping() { return "pong"; }
+                `}
+            )
+          ],
+          durableObjectNamespaces = [
+            ( className = "Parent",
+              uniqueKey = "parentkey",
+            )
+          ],
+          durableObjectStorage = (localDisk = "my-disk")
+        )
+      ),
+      ( name = "my-disk",
+        disk = (
+          path = "../../do-storage",
+          writable = true,
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj;
+
+  TestServer test(config);
+  test.root->openSubdir(kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+
+  // The abort is reported to the caller rather than taking the process down...
+  conn.httpGet200("/", "aborted: true");
+
+  // ... and the server is still serving afterwards, on a freshly-constructed actor.
+  conn.httpGet200("/", "aborted: true");
+}
+
+// Strengthened variant of the facet-UAF reproduction (added during fix verification).
+//
+// The base test above builds the precondition (a detached facet whose cached ActorChannelImpl
+// survives the parent's abort) but, in a plain server-test process, the parent IoContext -- which
+// owns the cached child channel -- is torn down synchronously during ctx.abort(), while the parent
+// ActorContainer is still alive, so updateAccessTime() walks a live parent and no UAF occurs.
+//
+// Production differs in one way the base test does not model: the actor is kept alive by an
+// in-flight request, so its IoContext (and the cached child channel) is destroyed later, during
+// the cancellation cascade, AFTER monitorOnBroken() has already erased the parent ActorContainer.
+// This variant adds that ingredient: a second, concurrent hold() RPC that blocks forever, so a
+// request reference keeps the parent actor alive across the abort and defers the child channel's
+// destruction to cancellation -- reproducing the ordering the production segfault needs.
+KJ_TEST("Server: DO facet outliving an aborted parent (in-flight hold)") {
+  kj::StringPtr config = R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `
+                `export default {
+                `  async fetch(request, env, ctx) {
+                `    let id = ctx.exports.Parent.idFromName("test");
+                `    let actor = ctx.exports.Parent.get(id);
+                `    // A concurrent request that blocks forever, started before the aborting one.
+                `    // Its reference keeps the Parent actor (and its IoContext, holding the cached
+                `    // child facet channel) alive across the abort, so teardown is deferred to the
+                `    // cancellation cascade after the parent container has been erased.
+                `    let held = actor.hold().then(() => "ok", () => "cancelled");
+                `    let result;
+                `    try {
+                `      result = await actor.fetch(request);
+                `    } catch (err) {
+                `      result = "aborted: " + err.message.includes("parent aborted");
+                `    }
+                `    await held;
+                `    return new Response(result);
+                `  }
+                `}
+                `
+                `export class Parent extends DurableObject {
+                `  async hold() {
+                `    // Stay in-flight forever; cancelled only when the actor is aborted.
+                `    await new Promise(() => {});
+                `  }
+                `  async fetch(request) {
+                `    let facet = this.ctx.facets.get("child",
+                `        () => ({class: this.ctx.exports.Child}));
+                `    await facet.ping();
+                `    this.detachedFacet = facet;
+                `    this.ctx.facets.abort("child", new Error("detached"));
+                `    this.ctx.abort(new Error("parent aborted"));
+                `    return new Response("unreachable");
+                `  }
+                `}
+                `
+                `export class Child extends DurableObject {
+                `  ping() { return "pong"; }
+                `}
+            )
+          ],
+          durableObjectNamespaces = [
+            ( className = "Parent",
+              uniqueKey = "parentkey",
+            )
+          ],
+          durableObjectStorage = (localDisk = "my-disk")
+        )
+      ),
+      ( name = "my-disk",
+        disk = (
+          path = "../../do-storage",
+          writable = true,
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj;
+
+  TestServer test(config);
+  test.root->openSubdir(kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "aborted: true");
+  conn.httpGet200("/", "aborted: true");
+}
+
+// Most faithful reproduction: drive the *actual* production trigger -- an alarm handler that
+// overruns its execution-time limit, so workerd aborts the context from global-scope.c++
+// (LOG "Alarm exceeded its allowed execution time" -> context.abort()) on the event loop while
+// the alarm request is in flight. server-test's limit enforcer returns getAlarmLimit() = 15min,
+// and TestServer::wait() advances the fake timer through it. The alarm handler builds the facet
+// precondition (executeCode runs in a facet during an alarm turn, per the deployment) and then
+// blocks, exactly as the ten production overruns did.
+KJ_TEST("Server: DO facet outliving an alarm-overrun abort") {
+  kj::StringPtr config = R"((
+    services = [
+      ( name = "hello",
+        worker = (
+          compatibilityDate = "2026-04-01",
+          modules = [
+            ( name = "main.js",
+              esModule =
+                `import { DurableObject } from "cloudflare:workers";
+                `
+                `export default {
+                `  async fetch(request, env, ctx) {
+                `    let id = ctx.exports.Parent.idFromName("test");
+                `    let actor = ctx.exports.Parent.get(id);
+                `    return await actor.fetch(request);
+                `  }
+                `}
+                `
+                `export class Parent extends DurableObject {
+                `  async fetch(request) {
+                `    console.log("MARK fetch now=" + Date.now());
+                `    await this.ctx.storage.setAlarm(60000);
+                `    console.log("MARK alarm-set");
+                `    return new Response("armed");
+                `  }
+                `  async alarm() {
+                `    console.log("MARK alarm-entry now=" + Date.now());
+                `    let facet = this.ctx.facets.get("child",
+                `        () => ({class: this.ctx.exports.Child}));
+                `    await facet.ping();
+                `    console.log("MARK alarm-pinged");
+                `    this.detachedFacet = facet;
+                `    this.ctx.facets.abort("child", new Error("detached"));
+                `    console.log("MARK alarm-detached-blocking");
+                `    await new Promise(() => {});
+                `  }
+                `}
+                `
+                `export class Child extends DurableObject {
+                `  ping() { return "pong"; }
+                `}
+            )
+          ],
+          durableObjectNamespaces = [
+            ( className = "Parent",
+              uniqueKey = "parentkey",
+            )
+          ],
+          durableObjectStorage = (localDisk = "my-disk")
+        )
+      ),
+      ( name = "my-disk",
+        disk = (
+          path = "../../do-storage",
+          writable = true,
+        )
+      ),
+    ],
+    sockets = [
+      ( name = "main",
+        address = "test-addr",
+        service = "hello"
+      )
+    ]
+  ))"_kj;
+
+  TestServer test(config, Worker::ConsoleMode::STDOUT);
+  test.root->openSubdir(kj::Path({"do-storage"_kj}), kj::WriteMode::CREATE);
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.httpGet200("/", "armed");
+  test.wait(20 * 60);
+}
+
 KJ_TEST("Server: ctx.access from accessBlobHeader on Worker") {
   TestServer test(R"((
     services = [

@@ -574,6 +574,15 @@ class Server::ActorNamespace final {
           [&](kj::Own<Worker::Actor::HibernationManager>& m) { return kj::addRef(*m); });
     }
     void updateAccessTime() {
+      // A broken container can outlive its parent. When the parent is cleaned up it erases itself
+      // from the map it lives in, while a cached ActorChannelImpl still holds a reference to this
+      // one -- leaving `parent` and `root` dangling. Every path that removes a facet aborts it
+      // first, and every abort sets `brokenReason`, so this is where the upward walk has to stop.
+      //
+      // There is nothing to record either way: access time exists to drive eviction, and a broken
+      // container is not a candidate for it.
+      if (brokenReason != kj::none) return;
+
       lastAccess = timer.now();
       KJ_IF_SOME(p, parent) {
         p.updateAccessTime();
