@@ -406,9 +406,20 @@ struct ProxyEverything {
     enabled @0 :Bool $Json.name("enabled");
   }
 
+  struct Inspection {
+    httpPorts @0 :List(UInt16) $Json.name("httpPorts");
+    httpsPorts @1 :List(UInt16) $Json.name("httpsPorts");
+  }
+
+  struct Acknowledgement {
+    protocolVersion @0 :UInt16 $Json.name("protocolVersion");
+  }
+
   struct Port {
     port @0 :UInt16 $Json.name("port");
     dns @1 :Dns $Json.name("dns");
     internet @2 :Internet $Json.name("internet");
+    inspection @3 :Inspection $Json.name("inspection");
+    protocolVersion @4 :UInt16 $Json.name("protocolVersion");
   }
 }

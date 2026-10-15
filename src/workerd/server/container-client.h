@@ -166,6 +166,7 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
 
   struct SidecarInspectResponse {
     uint16_t ingressHostPort;
+    kj::String image;
   };
 
   struct SnapshotRestoreMount {
@@ -188,7 +189,6 @@ class ContainerClient final: public rpc::Container::Server, public kj::Refcounte
 
   kj::Promise<kj::Maybe<InspectResponse>> inspectContainer();
 
-  kj::Promise<void> updateSidecarEgressPort(uint16_t ingressHostPort, uint16_t egressPort);
   kj::Promise<void> updateSidecarEgressConfig(uint16_t ingressHostPort, uint16_t egressPort);
   kj::Promise<void> createContainer(kj::StringPtr effectiveImage,
       kj::Maybe<capnp::List<capnp::Text>::Reader> entrypoint,

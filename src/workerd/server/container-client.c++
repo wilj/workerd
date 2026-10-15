@@ -44,6 +44,7 @@ WD_STRONG_BOOL(Pty);
 namespace {
 
 constexpr uint16_t SIDECAR_INGRESS_PORT = 39001;
+constexpr uint16_t SIDECAR_EGRESS_PROTOCOL_VERSION = 1;
 
 // Default limit for JSON API responses (16 MiB — Docker JSON responses are small).
 constexpr uint64_t MAX_JSON_RESPONSE_SIZE = 16ULL * 1024 * 1024;
@@ -1638,25 +1639,12 @@ kj::Promise<kj::Maybe<ContainerClient::SidecarInspectResponse>> ContainerClient:
   auto requiredIngressHostPort =
       KJ_REQUIRE_NONNULL(ingressHostPort, "running sidecar missing ingress host port");
 
+  KJ_REQUIRE(jsonRoot.hasConfig() && jsonRoot.getConfig().hasImage(),
+      "running sidecar missing its configured image");
   co_return SidecarInspectResponse{
     .ingressHostPort = requiredIngressHostPort,
+    .image = kj::str(jsonRoot.getConfig().getImage()),
   };
-}
-
-kj::Promise<void> ContainerClient::updateSidecarEgressPort(
-    uint16_t ingressHostPort, uint16_t egressPort) {
-  capnp::JsonCodec codec;
-  codec.handleByAnnotation<docker_api::ProxyEverything::Port>();
-  capnp::MallocMessageBuilder message;
-  auto jsonRoot = message.initRoot<docker_api::ProxyEverything::Port>();
-  jsonRoot.setPort(egressPort);
-
-  auto body = codec.encode(jsonRoot);
-  auto response = co_await dockerApiRequest(network, kj::str("127.0.0.1:", ingressHostPort),
-      kj::HttpMethod::PUT, kj::str("/egress"), kj::mv(body));
-
-  JSG_REQUIRE(response.statusCode >= 200 && response.statusCode < 300, Error,
-      "Updating sidecar egress port failed with: ", response.statusCode, " ", response.body);
 }
 
 kj::Promise<void> ContainerClient::updateSidecarEgressConfig(
@@ -1666,6 +1654,21 @@ kj::Promise<void> ContainerClient::updateSidecarEgressConfig(
   capnp::MallocMessageBuilder message;
   auto jsonRoot = message.initRoot<docker_api::ProxyEverything::Port>();
   jsonRoot.setPort(egressPort);
+  jsonRoot.setProtocolVersion(SIDECAR_EGRESS_PROTOCOL_VERSION);
+
+  // Only registered HTTP/HTTPS ports need a client preface. Raw TCP must be connected
+  // immediately so server-first protocols can deliver their greeting.
+  kj::Vector<uint16_t> httpPorts;
+  kj::Vector<uint16_t> httpsPorts;
+  for (auto& mapping: egressState->mappings) {
+    if (mapping.protocol == EgressProtocol::HTTP) httpPorts.add(mapping.port);
+    if (mapping.protocol == EgressProtocol::HTTPS) httpsPorts.add(mapping.port);
+  }
+  auto inspection = jsonRoot.initInspection();
+  auto http = inspection.initHttpPorts(httpPorts.size());
+  auto https = inspection.initHttpsPorts(httpsPorts.size());
+  for (auto i: kj::indices(httpPorts)) http.set(i, httpPorts[i]);
+  for (auto i: kj::indices(httpsPorts)) https.set(i, httpsPorts[i]);
 
   auto allowHostnames = getDnsAllowHostnames();
   auto dns = jsonRoot.initDns();
@@ -1682,8 +1685,14 @@ kj::Promise<void> ContainerClient::updateSidecarEgressConfig(
   auto response = co_await dockerApiRequest(network, kj::str("127.0.0.1:", ingressHostPort),
       kj::HttpMethod::PUT, kj::str("/egress"), kj::mv(body));
 
-  JSG_REQUIRE(response.statusCode >= 200 && response.statusCode < 300, Error,
-      "Updating sidecar egress config failed with: ", response.statusCode, " ", response.body);
+  JSG_REQUIRE(response.statusCode == 200, Error,
+      "Container proxy egress protocol negotiation failed with: ", response.statusCode, " ",
+      response.body);
+  auto acknowledgement =
+      decodeJsonResponse<docker_api::ProxyEverything::Acknowledgement>(response.body);
+  JSG_REQUIRE(acknowledgement->getRoot<docker_api::ProxyEverything::Acknowledgement>()
+                  .getProtocolVersion() == SIDECAR_EGRESS_PROTOCOL_VERSION,
+      Error, "The container proxy does not support the runtime's egress protocol");
 }
 
 kj::Promise<void> ContainerClient::createContainer(kj::StringPtr effectiveImage,
@@ -2280,10 +2289,20 @@ kj::Promise<void> ContainerClient::status(StatusContext context) {
     // it to use our current egress listener port.
     auto sidecar = KJ_REQUIRE_NONNULL(co_await inspectSidecar(),
         "Recovered running container without a running networking sidecar");
-    containerSidecarStarted.store(true, std::memory_order_release);
-    this->sidecarIngressHostPort = sidecar.ingressHostPort;
-    co_await ensureEgressListenerStarted();
-    co_await updateSidecarEgressPort(sidecar.ingressHostPort, egressListenerPort);
+    if (sidecar.image != containerEgressInterceptorImage) {
+      // The proxy owns the shared network namespace, so its image cannot be replaced
+      // underneath a running application. Recreate the pair on the next start().
+      co_await destroyContainer();
+      co_await destroySidecarContainer();
+      isRunning = false;
+      containerStarted.store(false, std::memory_order_release);
+      labels.clear();
+    } else {
+      containerSidecarStarted.store(true, std::memory_order_release);
+      this->sidecarIngressHostPort = sidecar.ingressHostPort;
+      co_await ensureEgressListenerStarted();
+      co_await updateSidecarEgressConfig(sidecar.ingressHostPort, egressListenerPort);
+    }
   }
 
   context.getResults().setRunning(isRunning);

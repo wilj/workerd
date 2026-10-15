@@ -18,6 +18,28 @@
 namespace workerd::server {
 namespace {
 
+// Owner, 2026-10-14 HST: "yes" to workerd-authoritative proxy negotiation without timeout changes.
+KJ_TEST("versioned sidecar configuration preserves empty protocol inspection lists") {
+  capnp::MallocMessageBuilder message;
+  auto root = message.initRoot<docker_api::ProxyEverything::Port>();
+  root.setProtocolVersion(1);
+  root.setPort(9000);
+  auto inspection = root.initInspection();
+  inspection.initHttpPorts(0);
+  inspection.initHttpsPorts(0);
+  capnp::JsonCodec codec;
+  codec.handleByAnnotation<docker_api::ProxyEverything::Port>();
+  auto encoded = codec.encode(root);
+  auto decoded = decodeJsonResponse<docker_api::ProxyEverything::Port>(encoded);
+  auto config = decoded->getRoot<docker_api::ProxyEverything::Port>();
+  KJ_EXPECT(config.getProtocolVersion() == 1);
+  KJ_EXPECT(config.hasInspection());
+  KJ_EXPECT(config.getInspection().hasHttpPorts());
+  KJ_EXPECT(config.getInspection().hasHttpsPorts());
+  KJ_EXPECT(config.getInspection().getHttpPorts().size() == 0);
+  KJ_EXPECT(config.getInspection().getHttpsPorts().size() == 0);
+}
+
 // Regression test for VULN-127728: ContainerInspectResponse decode must not
 // use-after-free.  With the old buggy code every field access after decode
 // dereferences freed heap memory (detectable by ASAN).
