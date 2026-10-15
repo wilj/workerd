@@ -1471,8 +1471,10 @@ kj::Promise<ContainerClient::IPAMConfigResult> ContainerClient::getDockerBridgeI
     auto message = decodeJsonResponse<docker_api::Docker::NetworkInspectResponse>(response.body);
     auto jsonRoot = message->getRoot<docker_api::Docker::NetworkInspectResponse>();
     auto ipamConfig = jsonRoot.getIpam().getConfig();
-    if (ipamConfig.size() > 0) {
-      auto config = ipamConfig[0];
+    // This gateway and subnet configure the IPv4 egress listener and iptables rules.
+    // Docker may return the IPv6 entry first on a dual-stack bridge.
+    for (auto config: ipamConfig) {
+      if (kj::StringPtr(config.getSubnet()).findFirst(':') != kj::none) continue;
       co_return IPAMConfigResult{
         .gateway = kj::str(config.getGateway()),
         .subnet = kj::str(config.getSubnet()),
